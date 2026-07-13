@@ -46,10 +46,10 @@ from telethon.errors import (
 
 # ═══════════════════════════════ الإعدادات ═══════════════════════════════
 
-API_ID   = int(os.getenv("API_ID",   "36238013"))
-API_HASH =      os.getenv("API_HASH", "2be03a350efb289604019e119184d2a4")
-BOT_TOKEN=      os.getenv("BOT_TOKEN","8875226097:AAHUzlOBaS1OsIP0yk2QXQQodwJ-a1VcxJA")
-OWNER_ID = int(os.getenv("OWNER_ID", "8631892566"))
+API_ID   = int(os.getenv("API_ID"))
+API_HASH =      os.getenv("API_HASH")
+BOT_TOKEN=      os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID"))
 
 DB_PATH            = os.getenv("DB_PATH",   "bot_data.db")
 MEDIA_DIR          = os.getenv("MEDIA_DIR", "media_files")
