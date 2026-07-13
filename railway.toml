@@ -1,5 +1,6 @@
 [build]
 builder = "nixpacks"
+buildCommand = "pip install -r bot/requirements.txt"
 
 [deploy]
 startCommand = "cd bot && python autopost_bot.py"
