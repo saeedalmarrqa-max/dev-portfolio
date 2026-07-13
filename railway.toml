@@ -1,0 +1,6 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "cd bot && python autopost_bot.py"
+restartPolicyType = "always"
