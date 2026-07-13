@@ -1,7 +1,6 @@
 [build]
-builder = "nixpacks"
-buildCommand = "pip install -r bot/requirements.txt"
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "cd bot && python autopost_bot.py"
 restartPolicyType = "always"
