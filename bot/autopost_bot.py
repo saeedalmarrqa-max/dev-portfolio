@@ -30,7 +30,9 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
@@ -1929,6 +1931,24 @@ async def scheduler_loop():
         await asyncio.sleep(SCHEDULER_INTERVAL)
 
 
+# ═══════════════════════════════ خادم الإبقاء نشطاً ═══════════════════════════════
+
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"AutoPost Pro - Running!")
+
+    def log_message(self, format, *args):
+        pass  # تعطيل logs الخادم
+
+
+def run_keep_alive():
+    port = int(os.getenv("PORT", 5000))
+    server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
+    server.serve_forever()
+
+
 # ═══════════════════════════════ التشغيل ═══════════════════════════════
 
 async def main():
@@ -1937,6 +1957,10 @@ async def main():
         print("⚠️  لازم تحط API_ID و API_HASH قبل التشغيل!")
         print("احصل عليهم من: https://my.telegram.org")
         print("═" * 60)
+
+    # تشغيل خادم keep-alive في خيط منفصل
+    t = threading.Thread(target=run_keep_alive, daemon=True)
+    t.start()
 
     init_db()
     await bot.start(bot_token=BOT_TOKEN)
