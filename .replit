@@ -16,21 +16,6 @@ name = "Project"
 mode = "parallel"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "AutoPost Bot"
-
-[[workflows.workflow]]
-name = "AutoPost Bot"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "cd bot && python autopost_bot.py"
-
-[workflows.workflow.metadata]
-outputType = "console"
-
 [agent]
 stack = "PNPM_WORKSPACE"
 expertMode = true
