@@ -53,8 +53,10 @@ API_HASH =      os.getenv("API_HASH")
 BOT_TOKEN=      os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 
-DB_PATH            = os.getenv("DB_PATH",   "bot_data.db")
-MEDIA_DIR          = os.getenv("MEDIA_DIR", "media_files")
+# مسار قاعدة البيانات — يستخدم /data إذا كان Railway volume موصول
+_DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
+DB_PATH   = os.getenv("DB_PATH",   os.path.join(_DATA_DIR, "bot_data.db"))
+MEDIA_DIR = os.getenv("MEDIA_DIR", os.path.join(_DATA_DIR, "media_files"))
 SCHEDULER_INTERVAL = 20   # ثانية
 
 os.makedirs(MEDIA_DIR, exist_ok=True)
@@ -1499,18 +1501,179 @@ def parse_datetime(text):
 async def menu_posts(event):
     rows = [
         [
-            Button.inline("➕ نشر في قناة",    "post_add_pick_channel"),
-            Button.inline("📢 نشر في مجموعة",  "post_add_group_pick"),
+            Button.inline("➕ نشر في قناة",      "post_add_pick_channel"),
+            Button.inline("📢 نشر في مجموعة",    "post_add_group_pick"),
         ],
+        [Button.inline("🚀 نشر مباشر لأي جروب/قناة", "quick_direct_pick_account")],
         [
-            Button.inline("⚡ نشر فوري",       "post_instant_pick_channel"),
-            Button.inline("📋 عرض المنشورات", "posts_list"),
+            Button.inline("⚡ نشر فوري",         "post_instant_pick_channel"),
+            Button.inline("📋 عرض المنشورات",   "posts_list"),
         ],
     ] + back_button()
     await event.edit(
         "📝 *إدارة المنشورات*\n━━━━━━━━━━━━━━━━━━━━━━━━",
         buttons=rows,
     )
+
+
+# ═══════════════════════════════ النشر المباشر لأي جروب/قناة ═══════════════════════════════
+
+async def quick_direct_pick_account(event):
+    """اختر الحساب للنشر المباشر بدون إضافة مسبقة"""
+    user_id  = event.sender_id
+    accounts = list_accounts(user_id)
+    if not accounts:
+        await event.edit("⚠️ أضف حساباً أولاً.", buttons=back_button("menu_posts"))
+        return
+    rows = [[Button.inline(f"👤 {a['label']}", f"quick_direct_account:{a['id']}")] for a in accounts]
+    rows += cancel_button()
+    await event.edit(
+        "🚀 *النشر المباشر*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "اختر الحساب الذي سيُرسل:",
+        buttons=rows,
+    )
+
+
+async def quick_direct_use_account(event):
+    user_id    = event.sender_id
+    account_id = int(event.data.decode().split(":")[1])
+    STATE[user_id] = {"action": "waiting_quick_target", "account_id": account_id}
+    await event.edit(
+        "🚀 *النشر المباشر*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "اكتب معرف أو يوزرنيم الجروب/القناة:\n\n"
+        "_مثال: @mygroup أو -1001234567890_",
+        buttons=cancel_button(),
+    )
+
+
+async def handle_waiting_quick_target(event, st):
+    user_id = event.sender_id
+    target  = event.raw_text.strip()
+
+    # تحقق أن الحساب يقدر يوصل لهذا الجروب
+    account_row = get_account(st["account_id"])
+    try:
+        client = await get_userbot_client(account_row)
+        entity = await client.get_entity(target)
+        title  = getattr(entity, "title", None) or target
+    except Exception as e:
+        await event.respond(
+            f"❌ *ما أقدر أوصل لهذا الجروب*\n`{e}`\n\n"
+            "تأكد:\n• الحساب عضو في الجروب\n• اليوزرنيم صحيح",
+            buttons=cancel_button(),
+        )
+        return
+
+    st["target"]      = target
+    st["target_title"] = title
+    st["action"]      = "waiting_quick_message"
+    await event.respond(
+        f"✅ تم التحقق: *{title}*\n\n"
+        "✍️ اكتب الكليشة (الرسالة التي تريد إرسالها):\n"
+        "_يمكنك إرسال نص أو صورة أو فيديو_",
+        buttons=cancel_button(),
+    )
+
+
+async def handle_waiting_quick_message(event, st):
+    user_id    = event.sender_id
+    media_path = None
+    content_type = "text"
+    content_text = event.raw_text
+
+    if event.message.media:
+        filename     = uuid.uuid4().hex
+        media_path   = await event.download_media(file=os.path.join(MEDIA_DIR, filename))
+        content_text = event.message.text or None
+        if   event.photo:   content_type = "photo"
+        elif event.video:   content_type = "video"
+        else:               content_type = "document"
+    elif not event.raw_text:
+        await event.respond("❌ أرسل نصاً أو صورة.", buttons=cancel_button())
+        return
+
+    st["content_type"] = content_type
+    st["content_text"] = content_text
+    st["media_path"]   = media_path
+    st["action"]       = "waiting_quick_interval"
+    await event.respond(
+        "⏰ *الوقت بين كل رسالة*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "اكتب الفترة الزمنية:\n\n"
+        "• `20m` = كل 20 دقيقة\n"
+        "• `1h`  = كل ساعة\n"
+        "• `30s` = كل 30 ثانية\n"
+        "• `1d`  = كل يوم",
+        buttons=cancel_button(),
+    )
+
+
+async def handle_waiting_quick_interval(event, st):
+    seconds = parse_interval_to_seconds(event.raw_text.strip())
+    if not seconds or seconds < 10:
+        await event.respond(
+            "❌ صيغة غير صحيحة أو أقل من 10 ثواني.\nحاول مثل: `20m` أو `1h`",
+            buttons=cancel_button(),
+        )
+        return
+    st["interval_seconds"] = seconds
+    st["action"]           = "waiting_quick_count"
+    await event.respond(
+        "🔢 *عدد الرسائل*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "كم مرة تريد الإرسال؟\n\n"
+        "• `0` = بلا حد (يرسل إلى ما لا نهاية)\n"
+        "• `20` = 20 مرة فقط ثم يتوقف",
+        buttons=cancel_button(),
+    )
+
+
+async def handle_waiting_quick_count(event, st):
+    user_id = event.sender_id
+    text    = event.raw_text.strip()
+    if not text.isdigit():
+        await event.respond("❌ أرسل رقماً فقط.", buttons=cancel_button())
+        return
+    max_count = int(text)
+    next_run  = datetime.datetime.utcnow() + datetime.timedelta(seconds=st["interval_seconds"])
+
+    # احفظ في DB كـ channel مؤقت بنفس الحساب
+    add_temp = add_group  # يستخدم نفس جدول channels بـ entity_type='group'
+    ch_id    = add_temp(user_id, st["account_id"], st["target"], st["target_title"])
+
+    # أنشئ المنشور
+    conn = get_conn()
+    cur  = conn.execute(
+        """INSERT INTO posts
+           (owner_user_id, channel_db_id, content_type, content_text, media_path,
+            schedule_type, interval_seconds, scheduled_time, next_run, status, created_at, publish_count, max_count)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (user_id, ch_id, st["content_type"], st.get("content_text"),
+         st.get("media_path"), "interval", st["interval_seconds"],
+         None, next_run.isoformat(), "active", _now(), 0, max_count),
+    )
+    conn.commit()
+    post_id = cur.lastrowid
+    conn.close()
+    clear_state(user_id)
+    role = get_role(user_id)
+
+    count_str = f"`{max_count}` مرة" if max_count > 0 else "♾️ بلا حد"
+    secs = st["interval_seconds"]
+    if   secs >= 86400: interval_str = f"كل {secs//86400} يوم"
+    elif secs >= 3600:  interval_str = f"كل {secs//3600} ساعة"
+    elif secs >= 60:    interval_str = f"كل {secs//60} دقيقة"
+    else:               interval_str = f"كل {secs} ثانية"
+
+    await event.respond(
+        f"✅ *تم إعداد النشر التلقائي!*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📢 الوجهة  : `{st['target_title']}`\n"
+        f"🔢 المنشور : `#{post_id}`\n"
+        f"⏰ الفترة  : {interval_str}\n"
+        f"📊 العدد   : {count_str}\n\n"
+        f"_سيبدأ الإرسال خلال {interval_str} تلقائياً_",
+        buttons=main_menu_buttons(role),
+    )
+
 
 
 async def post_add_pick_channel(event):
@@ -2368,6 +2531,7 @@ CALLBACK_ROUTES = {
     "menu_groups":                menu_groups,
     "group_add_pick_account":     group_add_pick_account,
     "post_add_group_pick":        post_add_group_pick,
+    "quick_direct_pick_account":  quick_direct_pick_account,
     "menu_auto_reply":            menu_auto_reply,
     "ar_add_pick_account":        ar_add_pick_account,
     "menu_emoji":                 menu_emoji,
@@ -2410,6 +2574,7 @@ PREFIX_ROUTES = {
     "ar_toggle:":                 ar_toggle,
     "ar_delete:":                 ar_delete,
     "ar_use_account:":            ar_use_account,
+    "quick_direct_account:":      quick_direct_use_account,
     "instant_use_channel:":       instant_use_channel,
     "post_use_channel:":          post_use_channel,
     "post_view:":                 post_view,
@@ -2438,6 +2603,10 @@ MESSAGE_STATE_ROUTES = {
     "waiting_ar_keyword":           handle_waiting_ar_keyword,
     "waiting_ar_text":              handle_waiting_ar_text,
     "waiting_emoji":                handle_waiting_emoji,
+    "waiting_quick_target":         handle_waiting_quick_target,
+    "waiting_quick_message":        handle_waiting_quick_message,
+    "waiting_quick_interval":       handle_waiting_quick_interval,
+    "waiting_quick_count":          handle_waiting_quick_count,
     "waiting_post_content":         handle_waiting_post_content,
     "waiting_instant_content":      handle_waiting_instant_content,
     "waiting_interval":             handle_waiting_interval,
