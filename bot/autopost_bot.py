@@ -165,6 +165,32 @@ def init_db():
     except Exception:
         pass
 
+    # ─── جداول جديدة ───
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS auto_replies (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_user_id INTEGER NOT NULL,
+            account_id    INTEGER NOT NULL,
+            group_ref     TEXT    NOT NULL,
+            keyword       TEXT    NOT NULL,
+            reply_text    TEXT    NOT NULL,
+            is_active     INTEGER NOT NULL DEFAULT 1,
+            created_at    TEXT
+        )
+    """)
+
+    # أعمدة جديدة بشكل تدريجي
+    for stmt in [
+        "ALTER TABLE channels ADD COLUMN entity_type TEXT DEFAULT 'channel'",
+        "ALTER TABLE posts    ADD COLUMN max_count   INTEGER DEFAULT 0",
+        "ALTER TABLE users    ADD COLUMN autopost_emoji TEXT DEFAULT ''",
+    ]:
+        try:
+            cur.execute(stmt)
+        except Exception:
+            pass
+
     conn.commit()
     conn.close()
 
@@ -482,6 +508,119 @@ def get_due_posts():
     return rows
 
 
+# ─────────────── مجموعات ───────────────
+
+def list_groups(owner_user_id):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM channels WHERE owner_user_id=? AND entity_type='group' ORDER BY id DESC",
+        (owner_user_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def list_channels_only(owner_user_id):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM channels WHERE owner_user_id=? AND entity_type='channel' ORDER BY id DESC",
+        (owner_user_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def add_group(owner_user_id, account_id, group_ref, title):
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO channels (owner_user_id, account_id, channel_ref, title, added_at, entity_type) VALUES (?,?,?,?,?,'group')",
+        (owner_user_id, account_id, group_ref, title, _now()),
+    )
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return new_id
+
+
+# ─────────────── رد تلقائي ───────────────
+
+def add_auto_reply(owner_user_id, account_id, group_ref, keyword, reply_text):
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO auto_replies (owner_user_id, account_id, group_ref, keyword, reply_text, created_at) VALUES (?,?,?,?,?,?)",
+        (owner_user_id, account_id, group_ref, keyword, reply_text, _now()),
+    )
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return new_id
+
+
+def list_auto_replies(owner_user_id):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM auto_replies WHERE owner_user_id=? ORDER BY id DESC",
+        (owner_user_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_auto_reply(reply_id):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM auto_replies WHERE id=?", (reply_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def delete_auto_reply(reply_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM auto_replies WHERE id=?", (reply_id,))
+    conn.commit()
+    conn.close()
+
+
+def toggle_auto_reply(reply_id):
+    row = get_auto_reply(reply_id)
+    if not row:
+        return None
+    new_val = 0 if row["is_active"] else 1
+    conn = get_conn()
+    conn.execute("UPDATE auto_replies SET is_active=? WHERE id=?", (new_val, reply_id))
+    conn.commit()
+    conn.close()
+    return new_val
+
+
+def list_active_auto_replies_for_account(account_id):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM auto_replies WHERE account_id=? AND is_active=1",
+        (account_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+# ─────────────── إيموجي المستخدم ───────────────
+
+def get_user_emoji(user_id):
+    row = get_user(user_id)
+    if row:
+        try:
+            return row["autopost_emoji"] or ""
+        except Exception:
+            return ""
+    return ""
+
+
+def set_user_emoji(user_id, emoji):
+    conn = get_conn()
+    conn.execute("UPDATE users SET autopost_emoji=? WHERE user_id=?", (emoji, user_id))
+    conn.commit()
+    conn.close()
+
+
 def global_stats():
     """إحصائيات عامة للمالك"""
     conn = get_conn()
@@ -506,12 +645,38 @@ def global_stats():
 
 bot = TelegramClient("control_bot_session", API_ID, API_HASH)
 
-active_userbots: dict = {}   # account_id → TelegramClient
-STATE: dict = {}              # user_id → dict
+active_userbots: dict = {}          # account_id → TelegramClient
+STATE: dict = {}                    # user_id → dict
+_ar_handlers_registered: set = set()  # account_ids التي سُجّل عليها الرد التلقائي
 
 
 def clear_state(user_id):
     STATE.pop(user_id, None)
+
+
+def _make_auto_reply_handler(account_id):
+    """ينشئ handler للرد التلقائي على الكلمات في المجموعات"""
+    async def handler(event):
+        if not event.is_group:
+            return
+        try:
+            text = (event.raw_text or "").lower()
+            if not text:
+                return
+            replies = list_active_auto_replies_for_account(account_id)
+            for r in replies:
+                if r["keyword"].lower() in text:
+                    # تحقق من المجموعة المحددة
+                    chat = await event.get_chat()
+                    chat_username = (getattr(chat, "username", "") or "").lower().lstrip("@")
+                    rule_ref      = r["group_ref"].lower().lstrip("@")
+                    chat_id_str   = str(event.chat_id)
+                    if rule_ref in (chat_username, chat_id_str):
+                        await event.reply(r["reply_text"])
+                        break
+        except Exception as e:
+            logger.warning(f"auto_reply error: {e}")
+    return handler
 
 
 async def get_userbot_client(account_row):
@@ -525,6 +690,15 @@ async def get_userbot_client(account_row):
         raise RuntimeError("جلسة هذا الحساب منتهية أو غير صالحة")
     active_userbots[acc_id] = client
     touch_account(acc_id)
+
+    # تسجيل handler الرد التلقائي مرة واحدة فقط
+    if acc_id not in _ar_handlers_registered:
+        client.add_event_handler(
+            _make_auto_reply_handler(acc_id),
+            events.NewMessage(incoming=True),
+        )
+        _ar_handlers_registered.add(acc_id)
+
     return client
 
 
@@ -546,14 +720,19 @@ def main_menu_buttons(role):
     """لوحة القائمة الرئيسية — صفان متوازيان"""
     rows = [
         [
-            Button.inline("👤 الحسابات",  "menu_accounts"),
-            Button.inline("📡 القنوات",   "menu_channels"),
+            Button.inline("👤 الحسابات",   "menu_accounts"),
+            Button.inline("📡 القنوات",    "menu_channels"),
         ],
         [
-            Button.inline("📝 المنشورات", "menu_posts"),
-            Button.inline("⚙️ التحكم",    "menu_control"),
+            Button.inline("📢 المجموعات",  "menu_groups"),
+            Button.inline("📝 المنشورات",  "menu_posts"),
         ],
         [
+            Button.inline("🤖 الرد التلقائي", "menu_auto_reply"),
+            Button.inline("✨ الإيموجي",    "menu_emoji"),
+        ],
+        [
+            Button.inline("⚙️ التحكم",     "menu_control"),
             Button.inline("📊 الإحصائيات", "menu_stats"),
         ],
     ]
@@ -1040,6 +1219,261 @@ async def channel_delete(event):
     await menu_channels(event)
 
 
+# ═══════════════════════════════ إدارة المجموعات ═══════════════════════════════
+
+async def menu_groups(event):
+    user_id = event.sender_id
+    accounts = list_accounts(user_id)
+    if not accounts:
+        await event.edit(
+            "⚠️ *لا توجد حسابات*\n\nأضف حساباً أولاً من قسم الحسابات.",
+            buttons=back_button(),
+        )
+        return
+
+    groups = list_groups(user_id)
+    rows   = [[Button.inline("➕ إضافة مجموعة", "group_add_pick_account")]]
+    for g in groups:
+        rows.append([
+            Button.inline(f"📢 {g['title'] or g['channel_ref']}", f"group_view:{g['id']}"),
+            Button.inline("🗑️", f"group_delete_confirm:{g['id']}"),
+        ])
+    rows += back_button()
+
+    lines = ["📢 *إدارة المجموعات*", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+    if groups:
+        for g in groups:
+            lines.append(f"• `{g['title'] or g['channel_ref']}` — ID: `{g['id']}`")
+    else:
+        lines.append("_لا توجد مجموعات مضافة بعد._")
+
+    await event.edit("\n".join(lines), buttons=rows)
+
+
+async def group_view(event):
+    group_id = int(event.data.decode().split(":")[1])
+    g = get_channel(group_id)
+    if not g:
+        await event.answer("المجموعة غير موجودة!", alert=True)
+        return
+    posts = [p for p in list_posts(event.sender_id) if p["channel_db_id"] == group_id]
+    text = (
+        f"📢 *تفاصيل المجموعة*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏷️ الاسم  : `{g['title']}`\n"
+        f"🔗 المعرف : `{g['channel_ref']}`\n"
+        f"📝 المنشورات: `{len(posts)}`"
+    )
+    rows = [
+        [Button.inline("🗑️ حذف المجموعة", f"group_delete_confirm:{group_id}")],
+    ] + back_button("menu_groups")
+    await event.edit(text, buttons=rows)
+
+
+async def group_add_pick_account(event):
+    user_id  = event.sender_id
+    accounts = list_accounts(user_id)
+    rows     = [[Button.inline(f"👤 {a['label']}", f"group_use_account:{a['id']}")] for a in accounts]
+    rows    += cancel_button()
+    await event.edit("اختر الحساب الذي سينشر في المجموعة:", buttons=rows)
+
+
+async def group_use_account(event):
+    user_id    = event.sender_id
+    account_id = int(event.data.decode().split(":")[1])
+    STATE[user_id] = {"action": "waiting_group_ref", "account_id": account_id}
+    await event.edit(
+        "📢 *إضافة مجموعة*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "أرسل معرف المجموعة أو يوزرنيمها:\n\n"
+        "_مثال: @mygroup أو -100123456789_\n\n"
+        "⚠️ تأكد أن الحساب المختار عضو في المجموعة.",
+        buttons=cancel_button(),
+    )
+
+
+async def handle_waiting_group_ref(event, st):
+    user_id    = event.sender_id
+    group_ref  = event.raw_text.strip()
+    account_row = get_account(st["account_id"])
+
+    try:
+        client = await get_userbot_client(account_row)
+        entity = await client.get_entity(group_ref)
+        title  = getattr(entity, "title", None) or group_ref
+    except Exception as e:
+        await event.respond(
+            f"❌ *لم يتم العثور على المجموعة*\n`{e}`\n\nتأكد أن الحساب عضو فيها.",
+            buttons=cancel_button(),
+        )
+        return
+
+    add_group(user_id, st["account_id"], group_ref, title)
+    clear_state(user_id)
+    role = get_role(user_id)
+    await event.respond(
+        f"✅ *تمت إضافة المجموعة!*\n\n📢 `{title}`",
+        buttons=main_menu_buttons(role),
+    )
+
+
+async def group_delete_confirm(event):
+    group_id = int(event.data.decode().split(":")[1])
+    g = get_channel(group_id)
+    if not g:
+        await event.answer("المجموعة غير موجودة!", alert=True)
+        return
+    await event.edit(
+        f"⚠️ *تأكيد الحذف*\n\nحذف المجموعة:\n`{g['title'] or g['channel_ref']}`؟\n\n"
+        "سيتم حذف المنشورات المرتبطة بها.",
+        buttons=confirm_buttons(f"group_delete:{group_id}", "menu_groups"),
+    )
+
+
+async def group_delete(event):
+    group_id = int(event.data.decode().split(":")[1])
+    delete_channel(group_id)
+    await event.answer("✅ تم الحذف")
+    await menu_groups(event)
+
+
+# ─── نشر في المجموعات ───
+
+async def post_add_group_pick(event):
+    user_id = event.sender_id
+    groups  = list_groups(user_id)
+    if not groups:
+        await event.edit(
+            "⚠️ *لا توجد مجموعات*\n\nأضف مجموعة أولاً من قسم المجموعات.",
+            buttons=back_button("menu_posts"),
+        )
+        return
+    rows = [[Button.inline(f"📢 {g['title'] or g['channel_ref']}", f"post_use_group:{g['id']}")] for g in groups]
+    rows += cancel_button()
+    await event.edit("اختر المجموعة التي تريد النشر فيها:", buttons=rows)
+
+
+async def post_use_group(event):
+    user_id       = event.sender_id
+    channel_db_id = int(event.data.decode().split(":")[1])
+    STATE[user_id] = {
+        "action":        "waiting_group_post_content",
+        "channel_db_id": channel_db_id,
+    }
+    await event.edit(
+        "📢 *نشر في المجموعة*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "أرسل الكليشة (نص أو صورة أو فيديو):",
+        buttons=cancel_button(),
+    )
+
+
+async def handle_waiting_group_post_content(event, st):
+    user_id      = event.sender_id
+    media_path   = None
+    content_type = "text"
+    content_text = event.raw_text
+
+    if event.message.media:
+        filename     = uuid.uuid4().hex
+        media_path   = await event.download_media(file=os.path.join(MEDIA_DIR, filename))
+        content_text = event.message.text or None
+        if   event.photo:   content_type = "photo"
+        elif event.video:   content_type = "video"
+        else:               content_type = "document"
+    elif not event.raw_text:
+        await event.respond("❌ نوع المحتوى غير مدعوم.", buttons=cancel_button())
+        return
+
+    STATE[user_id].update({
+        "content_type": content_type,
+        "content_text": content_text,
+        "media_path":   media_path,
+        "action":       "waiting_group_post_time",
+    })
+    await event.respond(
+        "⏰ *متى تريد النشر؟*\n\n"
+        "مثال:\n"
+        "• `10m` = كل 10 دقائق\n"
+        "• `2h`  = كل ساعتين\n"
+        "• `2026-08-01 14:00` = مرة واحدة بتاريخ محدد",
+        buttons=cancel_button(),
+    )
+
+
+async def handle_waiting_group_post_time(event, st):
+    user_id = event.sender_id
+    text    = event.raw_text.strip()
+
+    # جرب interval أولاً
+    seconds = parse_interval_to_seconds(text)
+    if seconds and seconds >= 10:
+        STATE[user_id].update({"action": "waiting_group_post_count", "interval_seconds": seconds, "schedule_type": "interval"})
+        await event.respond(
+            "🔢 *كم مرة تريد الإرسال؟*\n\n"
+            "• `0` = بلا حد (مستمر)\n"
+            "• `5` = 5 مرات فقط ثم يوقف",
+            buttons=cancel_button(),
+        )
+        return
+
+    # جرب وقت محدد
+    dt = parse_datetime(text)
+    if dt and dt > datetime.datetime.utcnow():
+        st.update({"schedule_type": "once", "interval_seconds": None, "next_run": dt})
+        await _finalize_group_post(event, st, max_count=1)
+        return
+
+    await event.respond(
+        "❌ صيغة غير صحيحة. أرسل مثل `10m` أو `2026-08-01 14:00`",
+        buttons=cancel_button(),
+    )
+
+
+async def handle_waiting_group_post_count(event, st):
+    text = event.raw_text.strip()
+    if not text.isdigit():
+        await event.respond("❌ أرسل رقماً فقط (0 = بلا حد).", buttons=cancel_button())
+        return
+    max_count = int(text)
+    next_run  = datetime.datetime.utcnow() + datetime.timedelta(seconds=st["interval_seconds"])
+    st["next_run"] = next_run
+    await _finalize_group_post(event, st, max_count=max_count)
+
+
+async def _finalize_group_post(event, st, max_count=0):
+    user_id = event.sender_id
+    conn    = get_conn()
+    cur     = conn.execute(
+        """INSERT INTO posts
+           (owner_user_id, channel_db_id, content_type, content_text, media_path,
+            schedule_type, interval_seconds, scheduled_time, next_run, status, created_at, publish_count, max_count)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (user_id, st["channel_db_id"], st["content_type"], st.get("content_text"),
+         st.get("media_path"), st["schedule_type"], st.get("interval_seconds"),
+         None, st["next_run"].isoformat(), "active", _now(), 0, max_count),
+    )
+    conn.commit()
+    post_id = cur.lastrowid
+    conn.close()
+    clear_state(user_id)
+    role = get_role(user_id)
+
+    count_str = f"`{max_count}` مرة" if max_count > 0 else "بلا حد"
+    sched_str = (
+        f"كل `{st['interval_seconds']}` ثانية | عدد: {count_str}"
+        if st["schedule_type"] == "interval"
+        else f"مرة واحدة في `{st['next_run'].strftime('%Y-%m-%d %H:%M')} UTC`"
+    )
+
+    await event.respond(
+        f"✅ *تمت إضافة منشور المجموعة!*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔢 المعرف  : `#{post_id}`\n"
+        f"🗓️ الجدولة : {sched_str}",
+        buttons=main_menu_buttons(role),
+    )
+
+
 # ═══════════════════════════════ إدارة المنشورات ═══════════════════════════════
 
 def parse_interval_to_seconds(text):
@@ -1065,10 +1499,13 @@ def parse_datetime(text):
 async def menu_posts(event):
     rows = [
         [
-            Button.inline("➕ إضافة منشور",   "post_add_pick_channel"),
+            Button.inline("➕ نشر في قناة",    "post_add_pick_channel"),
+            Button.inline("📢 نشر في مجموعة",  "post_add_group_pick"),
+        ],
+        [
+            Button.inline("⚡ نشر فوري",       "post_instant_pick_channel"),
             Button.inline("📋 عرض المنشورات", "posts_list"),
         ],
-        [Button.inline("⚡ نشر فوري",         "post_instant_pick_channel")],
     ] + back_button()
     await event.edit(
         "📝 *إدارة المنشورات*\n━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -1755,6 +2192,169 @@ async def sub_remove(event):
     await menu_subs(event)
 
 
+# ═══════════════════════════════ الرد التلقائي ═══════════════════════════════
+
+async def menu_auto_reply(event):
+    user_id = event.sender_id
+    replies = list_auto_replies(user_id)
+    rows    = [[Button.inline("➕ إضافة رد تلقائي", "ar_add_pick_account")]]
+    for r in replies:
+        status = "🟢" if r["is_active"] else "⏸️"
+        rows.append([
+            Button.inline(f"{status} {r['keyword'][:20]}", f"ar_view:{r['id']}"),
+            Button.inline("🗑️", f"ar_delete:{r['id']}"),
+        ])
+    rows += back_button()
+    lines = ["🤖 *الرد التلقائي*", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+    if replies:
+        for r in replies:
+            st = "🟢" if r["is_active"] else "⏸️"
+            lines.append(f"{st} كلمة: `{r['keyword']}` — مجموعة: `{r['group_ref']}`")
+    else:
+        lines.append("_لا توجد ردود تلقائية بعد._")
+    await event.edit("\n".join(lines), buttons=rows)
+
+
+async def ar_view(event):
+    reply_id = int(event.data.decode().split(":")[1])
+    r = get_auto_reply(reply_id)
+    if not r:
+        await event.answer("الرد غير موجود!", alert=True)
+        return
+    status = "🟢 نشط" if r["is_active"] else "⏸️ موقوف"
+    text = (
+        f"🤖 *تفاصيل الرد التلقائي*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 الكلمة   : `{r['keyword']}`\n"
+        f"📢 المجموعة : `{r['group_ref']}`\n"
+        f"💬 الرد     : `{r['reply_text']}`\n"
+        f"📊 الحالة   : {status}"
+    )
+    toggle_label = "⏸️ إيقاف" if r["is_active"] else "▶️ تشغيل"
+    rows = [
+        [Button.inline(toggle_label, f"ar_toggle:{reply_id}")],
+        [Button.inline("🗑️ حذف",     f"ar_delete:{reply_id}")],
+    ] + back_button("menu_auto_reply")
+    await event.edit(text, buttons=rows)
+
+
+async def ar_toggle(event):
+    reply_id = int(event.data.decode().split(":")[1])
+    new_val  = toggle_auto_reply(reply_id)
+    await event.answer("🟢 تم التفعيل" if new_val else "⏸️ تم الإيقاف")
+    await ar_view(event)
+
+
+async def ar_delete(event):
+    reply_id = int(event.data.decode().split(":")[1])
+    delete_auto_reply(reply_id)
+    await event.answer("✅ تم الحذف")
+    await menu_auto_reply(event)
+
+
+async def ar_add_pick_account(event):
+    user_id  = event.sender_id
+    accounts = list_accounts(user_id)
+    if not accounts:
+        await event.edit("⚠️ أضف حساباً أولاً.", buttons=back_button("menu_auto_reply"))
+        return
+    rows = [[Button.inline(f"👤 {a['label']}", f"ar_use_account:{a['id']}")] for a in accounts]
+    rows += cancel_button()
+    await event.edit("اختر الحساب الذي سيرد تلقائياً:", buttons=rows)
+
+
+async def ar_use_account(event):
+    user_id    = event.sender_id
+    account_id = int(event.data.decode().split(":")[1])
+    STATE[user_id] = {"action": "waiting_ar_group", "account_id": account_id}
+    await event.edit(
+        "📢 *الرد التلقائي*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "أرسل يوزرنيم السوبر قروب:\n_مثال: @mygroup_",
+        buttons=cancel_button(),
+    )
+
+
+async def handle_waiting_ar_group(event, st):
+    user_id   = event.sender_id
+    group_ref = event.raw_text.strip()
+    st["group_ref"] = group_ref
+    st["action"]    = "waiting_ar_keyword"
+    await event.respond(
+        "🔑 *الكلمة المفتاحية*\n\nأرسل الكلمة التي إذا كُتبت في المجموعة يرد البوت عليها:",
+        buttons=cancel_button(),
+    )
+
+
+async def handle_waiting_ar_keyword(event, st):
+    user_id      = event.sender_id
+    st["keyword"] = event.raw_text.strip()
+    st["action"]  = "waiting_ar_text"
+    await event.respond(
+        "💬 *نص الرد*\n\nأرسل الرد الذي سيُرسله البوت تلقائياً:",
+        buttons=cancel_button(),
+    )
+
+
+async def handle_waiting_ar_text(event, st):
+    user_id    = event.sender_id
+    reply_text = event.raw_text.strip()
+    add_auto_reply(user_id, st["account_id"], st["group_ref"], st["keyword"], reply_text)
+    clear_state(user_id)
+    role = get_role(user_id)
+    await event.respond(
+        f"✅ *تم إضافة الرد التلقائي!*\n\n"
+        f"🔑 الكلمة : `{st['keyword']}`\n"
+        f"📢 المجموعة: `{st['group_ref']}`\n"
+        f"💬 الرد   : `{reply_text}`",
+        buttons=main_menu_buttons(role),
+    )
+
+
+# ═══════════════════════════════ إعداد الإيموجي ═══════════════════════════════
+
+async def menu_emoji(event):
+    user_id = event.sender_id
+    emoji   = get_user_emoji(user_id) or "_(لا يوجد)_"
+    rows = [
+        [Button.inline("✏️ تغيير الإيموجي",  "emoji_change")],
+        [Button.inline("🗑️ إزالة الإيموجي", "emoji_clear")],
+    ] + back_button()
+    await event.edit(
+        f"✨ *إيموجي النشر التلقائي*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"الإيموجي الحالي: {emoji}\n\n"
+        f"_يُضاف تلقائياً في نهاية كل منشور مجدول._",
+        buttons=rows,
+    )
+
+
+async def emoji_change(event):
+    user_id = event.sender_id
+    STATE[user_id] = {"action": "waiting_emoji"}
+    await event.edit(
+        "✨ أرسل الإيموجي الذي تريد إضافته في نهاية كل منشور:\n\n_مثال: 🔥 أو 💎 أو ✅_",
+        buttons=cancel_button(),
+    )
+
+
+async def emoji_clear(event):
+    set_user_emoji(event.sender_id, "")
+    await event.answer("✅ تم إزالة الإيموجي")
+    await menu_emoji(event)
+
+
+async def handle_waiting_emoji(event, st):
+    user_id = event.sender_id
+    emoji   = event.raw_text.strip()
+    set_user_emoji(user_id, emoji)
+    clear_state(user_id)
+    role = get_role(user_id)
+    await event.respond(
+        f"✅ تم حفظ الإيموجي: {emoji}",
+        buttons=main_menu_buttons(role),
+    )
+
+
 # ═══════════════════════════════ موجّه الأزرار ═══════════════════════════════
 
 CALLBACK_ROUTES = {
@@ -1765,6 +2365,14 @@ CALLBACK_ROUTES = {
     "acc_add_session":            acc_add_session_start,
     "menu_channels":              menu_channels,
     "channel_add_pick_account":   channel_add_pick_account,
+    "menu_groups":                menu_groups,
+    "group_add_pick_account":     group_add_pick_account,
+    "post_add_group_pick":        post_add_group_pick,
+    "menu_auto_reply":            menu_auto_reply,
+    "ar_add_pick_account":        ar_add_pick_account,
+    "menu_emoji":                 menu_emoji,
+    "emoji_change":               emoji_change,
+    "emoji_clear":                emoji_clear,
     "menu_posts":                 menu_posts,
     "post_add_pick_channel":      post_add_pick_channel,
     "post_instant_pick_channel":  post_instant_pick_channel,
@@ -1793,6 +2401,15 @@ PREFIX_ROUTES = {
     "channel_use_account:":       channel_use_account,
     "channel_delete_confirm:":    channel_delete_confirm,
     "channel_delete:":            channel_delete,
+    "group_view:":                group_view,
+    "group_use_account:":         group_use_account,
+    "group_delete_confirm:":      group_delete_confirm,
+    "group_delete:":              group_delete,
+    "post_use_group:":            post_use_group,
+    "ar_view:":                   ar_view,
+    "ar_toggle:":                 ar_toggle,
+    "ar_delete:":                 ar_delete,
+    "ar_use_account:":            ar_use_account,
     "instant_use_channel:":       instant_use_channel,
     "post_use_channel:":          post_use_channel,
     "post_view:":                 post_view,
@@ -1808,18 +2425,26 @@ PREFIX_ROUTES = {
 }
 
 MESSAGE_STATE_ROUTES = {
-    "waiting_phone":            handle_waiting_phone,
-    "waiting_code":             handle_waiting_code,
-    "waiting_password":         handle_waiting_password,
-    "waiting_session_string":   handle_waiting_session_string,
-    "waiting_channel_ref":      handle_waiting_channel_ref,
-    "waiting_post_content":     handle_waiting_post_content,
-    "waiting_instant_content":  handle_waiting_instant_content,
-    "waiting_interval":         handle_waiting_interval,
-    "waiting_datetime":         handle_waiting_datetime,
-    "waiting_admin_id":         handle_waiting_admin_id,
-    "waiting_sub_id":           handle_waiting_sub_id,
-    "waiting_sub_days":         handle_waiting_sub_days,
+    "waiting_phone":                handle_waiting_phone,
+    "waiting_code":                 handle_waiting_code,
+    "waiting_password":             handle_waiting_password,
+    "waiting_session_string":       handle_waiting_session_string,
+    "waiting_channel_ref":          handle_waiting_channel_ref,
+    "waiting_group_ref":            handle_waiting_group_ref,
+    "waiting_group_post_content":   handle_waiting_group_post_content,
+    "waiting_group_post_time":      handle_waiting_group_post_time,
+    "waiting_group_post_count":     handle_waiting_group_post_count,
+    "waiting_ar_group":             handle_waiting_ar_group,
+    "waiting_ar_keyword":           handle_waiting_ar_keyword,
+    "waiting_ar_text":              handle_waiting_ar_text,
+    "waiting_emoji":                handle_waiting_emoji,
+    "waiting_post_content":         handle_waiting_post_content,
+    "waiting_instant_content":      handle_waiting_instant_content,
+    "waiting_interval":             handle_waiting_interval,
+    "waiting_datetime":             handle_waiting_datetime,
+    "waiting_admin_id":             handle_waiting_admin_id,
+    "waiting_sub_id":               handle_waiting_sub_id,
+    "waiting_sub_days":             handle_waiting_sub_days,
 }
 
 
@@ -1898,16 +2523,32 @@ async def scheduler_loop():
                     client = await get_userbot_client(account_row)
                     target = post["channel_ref"]
 
+                    # إضافة الإيموجي المميز
+                    emoji    = get_user_emoji(owner_id)
+                    base_txt = post["content_text"] or ""
+                    final_txt = f"{base_txt}\n{emoji}".strip() if emoji else base_txt or None
+
                     if post["content_type"] == "text":
-                        await client.send_message(target, post["content_text"] or "")
+                        await client.send_message(target, final_txt or "")
                     else:
                         await client.send_file(
                             target,
                             post["media_path"],
-                            caption=post["content_text"] or None,
+                            caption=final_txt,
                         )
 
                     increment_publish_count(post["id"])
+
+                    # التحقق من max_count
+                    try:
+                        mc = post["max_count"]
+                    except Exception:
+                        mc = 0
+                    updated = get_post(post["id"])
+                    if mc and mc > 0 and updated and updated["publish_count"] >= mc:
+                        mark_post_done(post["id"])
+                        logger.info(f"✅ منشور #{post['id']} اكتمل ({mc} مرة)")
+                        continue
                     logger.info(f"✅ نُشر المنشور #{post['id']} في {target}")
 
                 except FloodWaitError as e:
